@@ -58,27 +58,32 @@ def linear_relu_square(a: torch.Tensor, b: torch.Tensor, aux: torch.Tensor = Non
         return pre, post
     else:
         # Backward pass - aux contains the pre-activation from forward
-        # grad = 2 * pre * (pre > 0) * upstream_grad
-        grad = 2 * pre * torch.where(aux > 0, aux, torch.zeros_like(aux))
+        # d(relu(x)^2)/dx = 2 * relu(x) * (x > 0) = 2 * relu(x)
+        # pre here is the upstream gradient, aux is the saved pre-activation
+        grad = pre * 2 * F.relu(aux)
         return grad
 
 
 class FusedLinearReLUSquareFunction(torch.autograd.Function):
     """
-    Fused operation: relu(x @ W1.T)^2 @ W2.T
+    Fused operation: relu(x @ W1.T)^2 @ W2
     MPS-compatible replacement using PyTorch native operations.
+
+    Note: W1 projects up (D -> H), W2 projects down (H -> D).
+    Both weights stored as (H, D), but W1 is used transposed via F.linear.
     """
     @staticmethod
     def forward(ctx, x, W1, W2):
         # x: (B, T, D), W1: (H, D), W2: (H, D) -> output: (B, T, D)
+        # W1 used via F.linear (x @ W1.T), W2 used directly (post @ W2)
         x_flat = x.view(-1, x.shape[-1])
 
         # First linear + relu^2
         pre = F.linear(x_flat, W1)  # x @ W1.T
         post = F.relu(pre).square()
 
-        # Second linear
-        out = F.linear(post, W2)  # post @ W2.T
+        # Second linear (direct matmul since W2 is stored as (H, D))
+        out = post @ W2  # post @ W2
 
         ctx.save_for_backward(x, W1, W2, pre, post)
         return out.view(x.shape)
@@ -92,8 +97,8 @@ class FusedLinearReLUSquareFunction(torch.autograd.Function):
         # Gradient for W2: post.T @ grad_output
         dW2 = post.T @ grad_flat
 
-        # Gradient through second linear: grad_output @ W2
-        d_post = F.linear(grad_flat, W2.T)
+        # Gradient through second linear: grad_output @ W2.T (since forward is post @ W2)
+        d_post = F.linear(grad_flat, W2)
 
         # Gradient through relu^2: d(relu(x)^2)/dx = 2*relu(x)*(x>0) = 2*relu(x)
         d_pre = d_post * 2 * F.relu(pre)
