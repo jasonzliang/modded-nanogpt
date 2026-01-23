@@ -135,23 +135,20 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
 
         # Compute weighted losses for multi-token prediction
         losses = torch.zeros(n_rows, dtype=torch.float32, device=logits.device)
+        row_indices = torch.arange(n_rows, device=logits.device)
         for k in range(n_predict):
-            weight = mtp_weights[k].item()
-            if weight > 0:
-                # Get target indices, handling boundary
-                valid_mask = torch.arange(n_rows, device=logits.device) + k < n_rows
-                target_indices = torch.clamp(
-                    torch.arange(n_rows, device=logits.device) + k,
-                    max=n_rows - 1
-                )
-                shifted_targets = targets[target_indices]
+            weight = mtp_weights[k]  # Keep as tensor, don't use .item()
+            # Get target indices, handling boundary
+            valid_mask = (row_indices + k < n_rows).float()
+            target_indices = torch.clamp(row_indices + k, max=n_rows - 1)
+            shifted_targets = targets[target_indices]
 
-                # Gather the logits for targets
-                z_target = z.gather(1, shifted_targets.unsqueeze(1)).squeeze(1)
+            # Gather the logits for targets
+            z_target = z.gather(1, shifted_targets.unsqueeze(1)).squeeze(1)
 
-                # Cross entropy: lse - z_target
-                loss_k = (lse - z_target) * weight
-                losses += torch.where(valid_mask, loss_k, torch.zeros_like(loss_k))
+            # Cross entropy: lse - z_target (weight=0 naturally contributes nothing)
+            loss_k = (lse - z_target) * weight * valid_mask
+            losses += loss_k
 
         ctx.save_for_backward(logits, targets, mtp_weights, lse)
         ctx.params = (A, B, C)

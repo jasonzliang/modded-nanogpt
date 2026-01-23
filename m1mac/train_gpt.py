@@ -49,10 +49,94 @@ def get_device():
 device = get_device()
 print(f"Using device: {device}")
 
+def get_system_memory_gb():
+    """Get total system memory in GB."""
+    try:
+        import subprocess
+        # macOS specific: get physical memory
+        result = subprocess.run(['sysctl', '-n', 'hw.memsize'], capture_output=True, text=True)
+        mem_bytes = int(result.stdout.strip())
+        return mem_bytes / (1024 ** 3)
+    except Exception:
+        # Fallback: assume 16GB
+        return 16.0
+
+def calculate_memory_safe_batch_sizes(system_memory_gb: float, num_heads: int = 6, head_dim: int = 128):
+    """
+    Calculate safe batch sizes based on available system memory.
+
+    MPS memory management is complex - we need to account for:
+    - Model weights (~500MB)
+    - Activations and gradients (scales with batch size)
+    - Optimizer states (2x model size for Adam)
+    - Attention matrices (quadratic in sequence length)
+    - PyTorch/MPS overhead and fragmentation
+
+    We use conservative estimates to avoid OOM during backward pass.
+    """
+    # Very conservative: use only 5% of memory for attention budget
+    # The backward pass needs ~2-3x the forward pass memory
+    attention_budget_gb = system_memory_gb * 0.05
+    attention_budget_bytes = attention_budget_gb * (1024 ** 3)
+
+    # For paired head attention with bfloat16:
+    # attention_matrix = (seq_len * 2)^2 * (num_heads // 2) * 2 bytes
+    # But we also need gradients, so multiply by 3 for safety
+    num_paired_heads = num_heads // 2
+    bytes_per_element = 2  # bfloat16
+    safety_factor = 3  # Account for gradients and intermediate tensors
+
+    max_seq_len_squared = attention_budget_bytes / (4 * num_paired_heads * bytes_per_element * safety_factor)
+    max_seq_len = int(math.sqrt(max_seq_len_squared))
+
+    # Round down to nearest power of 2 for efficiency
+    max_seq_len = 2 ** int(math.log2(max(max_seq_len, 1)))
+
+    # Conservative caps based on system memory
+    if system_memory_gb <= 16:
+        max_seq_len = min(max_seq_len, 2048)  # 16GB: cap at 2K
+    elif system_memory_gb <= 32:
+        max_seq_len = min(max_seq_len, 4096)  # 32GB: cap at 4K
+    else:
+        max_seq_len = min(max_seq_len, 8192)  # 64GB+: cap at 8K
+
+    max_seq_len = max(max_seq_len, 512)  # Don't go below 512
+
+    # Calculate batch sizes (tokens = seq_len * grad_accum_steps)
+    val_batch_size = max_seq_len * grad_accum_steps
+
+    # Training batch sizes - scale conservatively with memory
+    if system_memory_gb <= 16:
+        train_bs_base = 2048 * grad_accum_steps  # 16K tokens
+    elif system_memory_gb <= 32:
+        train_bs_base = 4096 * grad_accum_steps  # 32K tokens
+    else:
+        train_bs_base = 8192 * grad_accum_steps  # 64K tokens
+
+    train_bs_schedule = (
+        train_bs_base,
+        train_bs_base * 2,
+        train_bs_base * 3,
+    )
+    train_bs_extension = train_bs_base * 3
+
+    return {
+        'val_batch_size': val_batch_size,
+        'train_bs_schedule': train_bs_schedule,
+        'train_bs_extension': train_bs_extension,
+        'max_seq_len': max_seq_len,
+    }
+
 # Disable distributed training for M1 (single GPU)
 world_size = 1
 rank = 0
 grad_accum_steps = 8  # Accumulate gradients to simulate larger batch
+
+# Calculate memory-safe batch sizes
+SYSTEM_MEMORY_GB = get_system_memory_gb()
+MEMORY_CONFIG = calculate_memory_safe_batch_sizes(SYSTEM_MEMORY_GB)
+print(f"System memory: {SYSTEM_MEMORY_GB:.1f} GB")
+print(f"Auto-configured batch sizes: val={MEMORY_CONFIG['val_batch_size']}, train={MEMORY_CONFIG['train_bs_schedule']}")
 
 # -----------------------------------------------------------------------------
 # Linear layer (no FP8 on MPS)
@@ -414,18 +498,20 @@ class NorMuonAndAdam:
             )
 
     @staticmethod
-    @torch.compile(dynamic=False, fullgraph=True)
+    # Note: torch.compile disabled for MPS - unsigned int types (uint16/uint32) not supported
     def _cautious_wd_and_update_inplace(p, mantissa, grad, wd_tensor, lr_tensor):
         assert p.dtype == mantissa.dtype == torch.uint16
         grad = grad.float()
         wd_factor = wd_tensor.to(torch.float32)
         lr_factor = lr_tensor.to(torch.float32)
-        p_precise_raw = (p.to(torch.uint32) << 16) | mantissa.to(torch.uint32)
+        p_precise_raw = (p.to(torch.int32) << 16) | mantissa.to(torch.int32)
         p_precise = p_precise_raw.view(torch.float32)
         mask = (grad * p_precise) >= 0
         p_precise.copy_(p_precise - (p_precise * mask * wd_factor * lr_factor) - (grad * lr_factor))
-        p.copy_((p_precise_raw >> 16).to(torch.uint16))
-        mantissa.copy_(p_precise_raw.to(torch.uint16))
+        # Extract bits back to uint16 via int16 view
+        p_precise_raw = p_precise.view(torch.int32)
+        p.copy_((p_precise_raw >> 16).to(torch.int16).view(torch.uint16))
+        mantissa.copy_(p_precise_raw.to(torch.int16).view(torch.uint16))
 
     @staticmethod
     @torch.compile(dynamic=False, fullgraph=True)
@@ -642,7 +728,7 @@ class PairedHeadCausalSelfAttention(nn.Module):
         v = v.transpose(1, 2)
 
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=yarn.attn_scale)
-        y = y.transpose(1, 2)
+        y = y.transpose(1, 2).contiguous()
 
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
@@ -1239,12 +1325,13 @@ class Hyperparameters:
     # data
     train_files: str = "../data/fineweb10B/fineweb_train_*.bin"
     val_files: str = "../data/fineweb10B/fineweb_val_*.bin"
-    val_tokens: int = 10485760
-    # batch sizes - REDUCED for M1 Mac memory constraints
-    train_bs_schedule: tuple = (2 * 2048 * 8, 4 * 2048 * 8, 6 * 2048 * 8)  # Reduced from 8/16/24
-    train_bs_extension: int = 6 * 2048 * 8
-    train_max_seq_len: int = 128 * 16
-    val_batch_size: int = 1 * 64 * 1024 * 8  # Reduced from 4x
+    # batch sizes - AUTO-CONFIGURED based on system memory
+    train_bs_schedule: tuple = MEMORY_CONFIG['train_bs_schedule']
+    train_bs_extension: int = MEMORY_CONFIG['train_bs_extension']
+    train_max_seq_len: int = min(128 * 16, MEMORY_CONFIG['max_seq_len'])
+    val_batch_size: int = MEMORY_CONFIG['val_batch_size']
+    # val_tokens must be divisible by val_batch_size
+    val_tokens: int = ((10485760 // MEMORY_CONFIG['val_batch_size']) * MEMORY_CONFIG['val_batch_size'])
     # optimization
     num_scheduled_iterations: int = 1560
     num_extension_iterations: int = 40
